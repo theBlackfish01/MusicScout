@@ -1,13 +1,16 @@
+import operator
 import os
-import re
 from enum import Enum
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
 
-from langchain_experimental.utilities import PythonREPL
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.tools import tool as lc_tool
+from langchain_experimental.utilities import PythonREPL
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel
 
 try:
@@ -20,6 +23,7 @@ except ImportError:  # pragma: no cover - compatibility fallback
 import dotenv
 dotenv.load_dotenv()
 
+
 class ToolTrace(TypedDict):
     agent: str
     tool: str
@@ -28,9 +32,11 @@ class ToolTrace(TypedDict):
 
 
 class AgentState(TypedDict):
-    messages: list[BaseMessage]
+    # add_messages reducer: node updates are appended, never overwrite
+    messages: Annotated[list[BaseMessage], add_messages]
     next: str
-    tool_traces: list[ToolTrace]
+    # operator.add reducer: node updates are concatenated
+    tool_traces: Annotated[list[ToolTrace], operator.add]
 
 
 class RouteChoice(str, Enum):
@@ -73,7 +79,7 @@ def _build_llm() -> tuple[str, BaseChatModel]:
     if provider == "gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
         return "gemini", ChatGoogleGenerativeAI(
-            model=os.getenv("GEMINI_MODEL", "gemini-.5-pro"),
+            model=os.getenv("GEMINI_MODEL", "gemini-1.5-pro"),
             google_api_key=os.getenv("GEMINI_API_KEY"),
             temperature=0,
         )
@@ -82,11 +88,31 @@ def _build_llm() -> tuple[str, BaseChatModel]:
     )
 
 
+# --- Tools ---
+
 duckduckgo_tool: DuckDuckGoSearchRun = DuckDuckGoSearchRun()
 wikipedia_tool: WikipediaQueryRun = WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper())
-python_repl: PythonREPL = PythonREPL()
+_python_repl = PythonREPL()
+
+
+@lc_tool
+def python_repl_tool(code: str) -> str:
+    """Execute Python code for arithmetic, statistics, and data analysis.
+    Input must be valid, executable Python code."""
+    return _python_repl.run(code)
+
+
+research_tools = [duckduckgo_tool, wikipedia_tool]
+analysis_tools = [python_repl_tool]
+_research_tool_node = ToolNode(research_tools)
+_analysis_tool_node = ToolNode(analysis_tools)
+
+# --- LLM and chains ---
+
 active_provider, llm = _build_llm()
 supervisor_chain = llm.with_structured_output(SupervisorDecision)
+research_llm = llm.bind_tools(research_tools)
+analysis_llm = llm.bind_tools(analysis_tools)
 
 SUPERVISOR_SYSTEM_PROMPT = """You are a routing supervisor. Based on the query and tool_traces, decide which agent to call next.
 If the query requires searching for facts, names, or history, route to ResearchAgent.
@@ -95,6 +121,8 @@ If mathematical calculation is required, you MUST route to AnalysisAgent before 
 Return FINISH only when the final answer is complete and all required computations are done."""
 
 
+# --- Helpers ---
+
 def _message_text(message: BaseMessage) -> str:
     content = message.content
     if isinstance(content, str):
@@ -102,135 +130,73 @@ def _message_text(message: BaseMessage) -> str:
     return str(content)
 
 
-def _latest_message_text(state: AgentState) -> str:
-    messages = state.get("messages", [])
-    if not messages:
-        return ""
-    return _message_text(messages[-1])
-
-
 def _original_user_query(state: AgentState) -> str:
     for message in state.get("messages", []):
         if isinstance(message, HumanMessage):
             return _message_text(message)
-    return _latest_message_text(state)
+    messages = state.get("messages", [])
+    return _message_text(messages[-1]) if messages else ""
 
 
-def _invoke_tool(tool: Any, tool_input: str) -> str:
-    if hasattr(tool, "invoke"):
-        return str(tool.invoke(tool_input))
-    if hasattr(tool, "run"):
-        return str(tool.run(tool_input))
-    raise TypeError(f"Unsupported tool type: {type(tool)!r}")
+# --- Node functions ---
 
+_RESEARCH_SYSTEM_MSG = SystemMessage(
+    content="You are a music research expert. Use the available search tools to find "
+            "accurate facts, biographies, history, and current information relevant to "
+            "the user's query. Always call a tool — do not answer from memory alone."
+)
 
-def _should_use_wikipedia(query: str) -> bool:
-    keywords = ("history", "origin", "biography", "born", "genre", "fact", "who is")
-    normalized = query.lower()
-    return any(keyword in normalized for keyword in keywords)
-
-
-def _should_use_duckduckgo(query: str) -> bool:
-    keywords = ("recent", "news", "trend", "latest", "today", "current")
-    normalized = query.lower()
-    return any(keyword in normalized for keyword in keywords)
-
-
-def _extract_expression(query: str) -> str | None:
-    candidates = re.findall(r"[0-9\.\+\-\*\/\(\)\s%]+", query)
-    for candidate in candidates:
-        expr = candidate.strip()
-        if not expr:
-            continue
-        if not any(ch.isdigit() for ch in expr):
-            continue
-        if re.fullmatch(r"[0-9\.\+\-\*\/\(\)\s%]+", expr):
-            return expr
-    return None
+_ANALYSIS_SYSTEM_MSG = SystemMessage(
+    content="You are a data analysis expert. Use the python_repl_tool to write and execute "
+            "Python code for all calculations, aggregations, and statistical analysis. "
+            "Always call the tool — do not compute in your head."
+)
 
 
 def research_node(state: AgentState) -> dict[str, Any]:
-    query = _latest_message_text(state)
-    traces = list(state.get("tool_traces", []))
-    messages = list(state.get("messages", []))
+    """LLM autonomously selects and invokes research tools, then synthesises findings."""
+    ai_msg = research_llm.invoke([_RESEARCH_SYSTEM_MSG] + state["messages"])
+    new_messages: list[BaseMessage] = [ai_msg]
+    new_traces: list[ToolTrace] = []
 
-    run_duckduckgo = _should_use_duckduckgo(query) or not _should_use_wikipedia(query)
-    run_wikipedia = _should_use_wikipedia(query)
-
-    outputs: list[str] = []
-
-    if run_duckduckgo:
-        ddg_output = _invoke_tool(duckduckgo_tool, query)
-        traces.append(
-            {
+    if ai_msg.tool_calls:
+        tool_msgs = _research_tool_node.invoke({"messages": [ai_msg]})["messages"]
+        new_messages.extend(tool_msgs)
+        for tc, tm in zip(ai_msg.tool_calls, tool_msgs):
+            new_traces.append({
                 "agent": "ResearchAgent",
-                "tool": "DuckDuckGoSearchRun",
-                "input": query,
-                "output": ddg_output,
-            }
-        )
-        outputs.append(f"DuckDuckGo:\n{ddg_output}")
+                "tool": tc["name"],
+                "input": str(tc["args"]),
+                "output": str(tm.content),
+            })
+        # Synthesise findings with full conversation context
+        synthesis = llm.invoke(state["messages"] + new_messages)
+        new_messages.append(synthesis)
 
-    if run_wikipedia:
-        wiki_output = _invoke_tool(wikipedia_tool, query)
-        traces.append(
-            {
-                "agent": "ResearchAgent",
-                "tool": "WikipediaQueryRun",
-                "input": query,
-                "output": wiki_output,
-            }
-        )
-        outputs.append(f"Wikipedia:\n{wiki_output}")
-
-    if not outputs:
-        fallback_output = _invoke_tool(duckduckgo_tool, query)
-        traces.append(
-            {
-                "agent": "ResearchAgent",
-                "tool": "DuckDuckGoSearchRun",
-                "input": query,
-                "output": fallback_output,
-            }
-        )
-        outputs.append(f"DuckDuckGo:\n{fallback_output}")
-
-    messages.append(
-        AIMessage(content="Research findings:\n\n" + "\n\n".join(outputs))
-    )
-    return {"messages": messages, "tool_traces": traces, "next": "Supervisor"}
+    return {"messages": new_messages, "tool_traces": new_traces}
 
 
 def analysis_node(state: AgentState) -> dict[str, Any]:
-    query = _latest_message_text(state)
-    traces = list(state.get("tool_traces", []))
-    messages = list(state.get("messages", []))
-    expression = _extract_expression(query)
+    """LLM autonomously generates and executes Python code via the REPL tool."""
+    ai_msg = analysis_llm.invoke([_ANALYSIS_SYSTEM_MSG] + state["messages"])
+    new_messages: list[BaseMessage] = [ai_msg]
+    new_traces: list[ToolTrace] = []
 
-    if expression:
-        code = (
-            "from statistics import mean\n"
-            f"expr = {expression!r}\n"
-            "result = eval(expr, {'__builtins__': {}}, {'mean': mean})\n"
-            "print(result)\n"
-        )
-    else:
-        code = (
-            f"query = {query!r}\n"
-            "print('No direct arithmetic expression found. Provide explicit numbers or formula for computation.')\n"
-        )
+    if ai_msg.tool_calls:
+        tool_msgs = _analysis_tool_node.invoke({"messages": [ai_msg]})["messages"]
+        new_messages.extend(tool_msgs)
+        for tc, tm in zip(ai_msg.tool_calls, tool_msgs):
+            new_traces.append({
+                "agent": "AnalysisAgent",
+                "tool": tc["name"],
+                "input": str(tc["args"]),
+                "output": str(tm.content),
+            })
+        # Synthesise results with full conversation context
+        synthesis = llm.invoke(state["messages"] + new_messages)
+        new_messages.append(synthesis)
 
-    repl_output = str(python_repl.run(code))
-    traces.append(
-        {
-            "agent": "AnalysisAgent",
-            "tool": "PythonREPL",
-            "input": code,
-            "output": repl_output,
-        }
-    )
-    messages.append(AIMessage(content=f"Analysis result:\n{repl_output}"))
-    return {"messages": messages, "tool_traces": traces, "next": "Supervisor"}
+    return {"messages": new_messages, "tool_traces": new_traces}
 
 
 def supervisor_node(state: AgentState) -> dict[str, Any]:
@@ -246,6 +212,8 @@ def supervisor_node(state: AgentState) -> dict[str, Any]:
     )
     return {"next": decision.next.value}
 
+
+# --- Graph assembly ---
 
 builder = StateGraph(AgentState)
 builder.add_node("Supervisor", supervisor_node)

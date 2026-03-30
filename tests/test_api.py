@@ -3,6 +3,10 @@ from contextlib import contextmanager
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
 
+import asyncio
+import httpx
+import openai
+
 from src import main
 
 
@@ -59,3 +63,44 @@ def test_execute_returns_422_when_thread_id_missing():
     )
 
     assert response.status_code == 422
+
+
+def test_execute_returns_408_on_timeout(monkeypatch):
+    # Simulate an upstream timeout from the LLM provider
+    def mock_invoke_timeout(query, thread_id):
+        raise asyncio.TimeoutError("Timeout")
+
+    monkeypatch.setattr(main, "invoke_graph", mock_invoke_timeout)
+    monkeypatch.setattr(main, "get_llm_callback", _dummy_openai_callback)
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/v1/execute", json={"query": "Test timeout", "thread_id": "thread-1"}
+    )
+
+    assert response.status_code == 408
+    assert response.json()["detail"] == "Upstream model request timed out."
+
+
+def test_execute_returns_502_on_provider_outage(monkeypatch):
+    # Simulate an OpenAI 500+ internal server error
+    def mock_invoke_outage(query, thread_id):
+        # Constructing the expected openai error format
+        request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+        response = httpx.Response(503, request=request)
+        raise openai.APIStatusError(
+            "Service Unavailable",
+            response=response,
+            body=None
+        )
+
+    monkeypatch.setattr(main, "invoke_graph", mock_invoke_outage)
+    monkeypatch.setattr(main, "get_llm_callback", _dummy_openai_callback)
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/v1/execute", json={"query": "Test outage", "thread_id": "thread-1"}
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Upstream model provider is unavailable."
