@@ -1,0 +1,9 @@
+langgraph
+langchain
+langchain-openai
+langchain-experimental
+fastapi
+uvicorn
+wikipedia
+duckduckgo-search
+langsmith
