@@ -1,0 +1,17 @@
+# Python Bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual Environment
+venv/
+.env/
+
+# Log Files
+*.log
+*.jsonl
+
+# Development Configurations
+*.env
+
+# Dependency Lock Files
+!requirements.txt
