@@ -5,6 +5,7 @@ __pycache__/
 # Virtual Environment
 venv/
 .env/
+.idea
 
 # Log Files
 *.log
@@ -15,3 +16,10 @@ venv/
 
 # Dependency Lock Files
 !requirements.txt
+
+# LangSmith Traces
+.langsmith/
+
+/MusicScout_Tickets.md
+
+CLAUDE.md
