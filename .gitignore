@@ -20,7 +20,7 @@ venv/
 # LangSmith Traces
 .langsmith/
 
-/MusicScout_Tickets.md
+/docs/MusicScout_Tickets.md
 
 CLAUDE.md
 AGENTS.md

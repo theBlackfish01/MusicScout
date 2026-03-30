@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
 
-import main
+from src import main
 
 
 class DummyCallback:

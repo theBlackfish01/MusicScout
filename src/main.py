@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from langchain_core.messages import AIMessage, BaseMessage
 from pydantic import BaseModel, Field
 
-from graph import active_provider, invoke_graph
+from src.graph import active_provider, invoke_graph
 
 try:
     from google.api_core.exceptions import InternalServerError as _GInternalError

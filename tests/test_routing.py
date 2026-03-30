@@ -1,6 +1,6 @@
 from langchain_core.messages import HumanMessage
 
-import graph
+from src import graph
 
 
 def _state_for(query: str, tool_traces: list[dict] | None = None) -> graph.AgentState:
