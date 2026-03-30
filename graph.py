@@ -4,8 +4,8 @@ from enum import Enum
 from typing import Any, TypedDict
 
 from langchain_experimental.utilities import PythonREPL
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
@@ -43,10 +43,49 @@ class SupervisorDecision(BaseModel):
     next: RouteChoice
 
 
+def _build_llm() -> tuple[str, BaseChatModel]:
+    """Select and instantiate the LLM based on environment configuration.
+
+    Priority:
+      1. LLM_PROVIDER env var (explicit override: "openai" | "gemini")
+      2. OPENAI_API_KEY present → openai
+      3. GEMINI_API_KEY present → gemini
+      4. Neither → EnvironmentError
+    """
+    provider = os.getenv("LLM_PROVIDER", "").lower()
+
+    if not provider:
+        if os.getenv("OPENAI_API_KEY"):
+            provider = "openai"
+        elif os.getenv("GEMINI_API_KEY"):
+            provider = "gemini"
+        else:
+            raise EnvironmentError(
+                "No LLM provider configured. Set OPENAI_API_KEY or GEMINI_API_KEY."
+            )
+
+    if provider == "openai":
+        from langchain_openai import ChatOpenAI
+        return "openai", ChatOpenAI(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+            temperature=0,
+        )
+    if provider == "gemini":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return "gemini", ChatGoogleGenerativeAI(
+            model=os.getenv("GEMINI_MODEL", "gemini-1.5-pro"),
+            google_api_key=os.getenv("GEMINI_API_KEY"),
+            temperature=0,
+        )
+    raise EnvironmentError(
+        f"Unknown LLM_PROVIDER: {provider!r}. Valid values are 'openai' or 'gemini'."
+    )
+
+
 duckduckgo_tool: DuckDuckGoSearchRun = DuckDuckGoSearchRun()
 wikipedia_tool: WikipediaQueryRun = WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper())
 python_repl: PythonREPL = PythonREPL()
-llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o"), temperature=0)
+active_provider, llm = _build_llm()
 supervisor_chain = llm.with_structured_output(SupervisorDecision)
 
 SUPERVISOR_SYSTEM_PROMPT = """You are a routing supervisor. Based on the query and tool_traces, decide which agent to call next.

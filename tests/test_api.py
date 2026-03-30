@@ -28,7 +28,7 @@ def test_execute_returns_200_with_valid_payload(monkeypatch):
             "tool_traces": [],
         },
     )
-    monkeypatch.setattr(main, "get_openai_callback", _dummy_openai_callback)
+    monkeypatch.setattr(main, "get_llm_callback", _dummy_openai_callback)
 
     client = TestClient(main.app)
     response = client.post(

@@ -1,9 +1,12 @@
 langgraph
 langchain
 langchain-openai
+langchain-google-genai
+langchain-community
 langchain-experimental
 fastapi
 uvicorn
+httpx
 wikipedia
 duckduckgo-search
 langsmith
