@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from langchain_core.messages import AIMessage, BaseMessage
 from pydantic import BaseModel, Field
 
-from src.graph import active_provider, invoke_graph
+from src.graph import invoke_graph, resolve_provider
 
 try:
     from google.api_core.exceptions import InternalServerError as _GInternalError
@@ -25,11 +25,10 @@ def _null_callback():
     yield SimpleNamespace(total_tokens=0, prompt_tokens=0, completion_tokens=0, total_cost=0.0)
 
 
-if active_provider == "openai":
+try:
     from langchain_community.callbacks.manager import get_openai_callback
-    get_llm_callback = get_openai_callback
-else:
-    get_llm_callback = _null_callback
+except ImportError:
+    get_openai_callback = _null_callback
 
 
 import dotenv
@@ -38,6 +37,8 @@ dotenv.load_dotenv()
 class ExecuteRequest(BaseModel):
     query: str = Field(..., min_length=1)
     thread_id: str = Field(..., min_length=1)
+    provider: str | None = Field(default=None, description="Optional LLM provider ('openai' or 'gemini')")
+    model: str | None = Field(default=None, description="Optional model name (e.g., 'gpt-4o', 'gemini-1.5-pro')")
 
 
 class ExecuteResponse(BaseModel):
@@ -48,7 +49,12 @@ class ExecuteResponse(BaseModel):
     total_cost_usd: float
 
 
+class HealthResponse(BaseModel):
+    status: str = "ok"
+
+
 app = FastAPI()
+
 
 
 def _message_to_text(message: Any) -> str:
@@ -77,8 +83,16 @@ def _extract_answer(state: dict[str, Any]) -> str:
 @app.post("/v1/execute", response_model=ExecuteResponse)
 def execute(request: ExecuteRequest) -> ExecuteResponse:
     try:
-        with get_llm_callback() as cb:
-            final_state = invoke_graph(query=request.query, thread_id=request.thread_id)
+        resolved_provider = resolve_provider(request.provider)
+        cb_manager = get_openai_callback if resolved_provider == "openai" else _null_callback
+
+        with cb_manager() as cb:
+            final_state = invoke_graph(
+                query=request.query, 
+                thread_id=request.thread_id,
+                provider=request.provider,
+                model=request.model
+            )
         answer = _extract_answer(final_state)
         return ExecuteResponse(
             answer=answer,
@@ -87,6 +101,8 @@ def execute(request: ExecuteRequest) -> ExecuteResponse:
             completion_tokens=int(getattr(cb, "completion_tokens", 0) or 0),
             total_cost_usd=float(getattr(cb, "total_cost", 0.0) or 0.0),
         )
+    except EnvironmentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
         raise HTTPException(status_code=408, detail="Upstream model request timed out.") from exc
     except openai.APIStatusError as exc:
@@ -98,3 +114,7 @@ def execute(request: ExecuteRequest) -> ExecuteResponse:
         if _GOOGLE_SERVER_ERRORS and isinstance(exc, _GOOGLE_SERVER_ERRORS):
             raise HTTPException(status_code=502, detail="Upstream model provider is unavailable.") from exc
         raise
+
+@app.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
+    return HealthResponse(status="ok")

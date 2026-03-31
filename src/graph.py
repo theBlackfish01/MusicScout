@@ -5,6 +5,7 @@ from typing import Annotated, Any, TypedDict
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables.config import RunnableConfig
 from langchain_core.tools import tool as lc_tool
 from langchain_experimental.utilities import PythonREPL
 from langgraph.checkpoint.memory import MemorySaver
@@ -49,16 +50,10 @@ class SupervisorDecision(BaseModel):
     next: RouteChoice
 
 
-def _build_llm() -> tuple[str, BaseChatModel]:
-    """Select and instantiate the LLM based on environment configuration.
-
-    Priority:
-      1. LLM_PROVIDER env var (explicit override: "openai" | "gemini")
-      2. OPENAI_API_KEY present → openai
-      3. GEMINI_API_KEY present → gemini
-      4. Neither → EnvironmentError
-    """
-    provider = os.getenv("LLM_PROVIDER", "").lower()
+def resolve_provider(provider_override: str | None = None) -> str:
+    """Resolve the active provider, considering overrides and environment variables."""
+    provider = provider_override or os.getenv("LLM_PROVIDER", "")
+    provider = provider.lower() if provider else ""
 
     if not provider:
         if os.getenv("OPENAI_API_KEY"):
@@ -69,17 +64,29 @@ def _build_llm() -> tuple[str, BaseChatModel]:
             raise EnvironmentError(
                 "No LLM provider configured. Set OPENAI_API_KEY or GEMINI_API_KEY."
             )
+    return provider
+
+
+def _build_llm(provider_override: str | None = None, model_override: str | None = None) -> tuple[str, BaseChatModel]:
+    """Select and instantiate the LLM based on environment configuration or request overrides.
+
+    Priority:
+      1. Request overrides
+      2. LLM_PROVIDER env var
+      3. OPENAI_API_KEY/GEMINI_API_KEY present
+    """
+    provider = resolve_provider(provider_override)
 
     if provider == "openai":
         from langchain_openai import ChatOpenAI
         return "openai", ChatOpenAI(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+            model=model_override or os.getenv("OPENAI_MODEL", "gpt-4o"),
             temperature=0,
         )
     if provider == "gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
         return "gemini", ChatGoogleGenerativeAI(
-            model=os.getenv("GEMINI_MODEL", "gemini-1.5-pro"),
+            model=model_override or os.getenv("GEMINI_MODEL", "gemini-1.5-pro"),
             google_api_key=os.getenv("GEMINI_API_KEY"),
             temperature=0,
         )
@@ -108,11 +115,7 @@ _research_tool_node = ToolNode(research_tools)
 _analysis_tool_node = ToolNode(analysis_tools)
 
 # --- LLM and chains ---
-
-active_provider, llm = _build_llm()
-supervisor_chain = llm.with_structured_output(SupervisorDecision)
-research_llm = llm.bind_tools(research_tools)
-analysis_llm = llm.bind_tools(analysis_tools)
+# Chains are now instantiated lazily within nodes using overrides from RunnableConfig.
 
 SUPERVISOR_SYSTEM_PROMPT = """You are a routing supervisor. Based on the query and tool_traces, decide which agent to call next.
 If the query requires searching for facts, names, or history, route to ResearchAgent.
@@ -153,8 +156,13 @@ _ANALYSIS_SYSTEM_MSG = SystemMessage(
 )
 
 
-def research_node(state: AgentState) -> dict[str, Any]:
+def research_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     """LLM autonomously selects and invokes research tools, then synthesises findings."""
+    provider = config.get("configurable", {}).get("provider")
+    model = config.get("configurable", {}).get("model")
+    _, llm = _build_llm(provider, model)
+    research_llm = llm.bind_tools(research_tools)
+
     ai_msg = research_llm.invoke([_RESEARCH_SYSTEM_MSG] + state["messages"])
     new_messages: list[BaseMessage] = [ai_msg]
     new_traces: list[ToolTrace] = []
@@ -176,8 +184,13 @@ def research_node(state: AgentState) -> dict[str, Any]:
     return {"messages": new_messages, "tool_traces": new_traces}
 
 
-def analysis_node(state: AgentState) -> dict[str, Any]:
+def analysis_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     """LLM autonomously generates and executes Python code via the REPL tool."""
+    provider = config.get("configurable", {}).get("provider")
+    model = config.get("configurable", {}).get("model")
+    _, llm = _build_llm(provider, model)
+    analysis_llm = llm.bind_tools(analysis_tools)
+
     ai_msg = analysis_llm.invoke([_ANALYSIS_SYSTEM_MSG] + state["messages"])
     new_messages: list[BaseMessage] = [ai_msg]
     new_traces: list[ToolTrace] = []
@@ -199,7 +212,12 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
     return {"messages": new_messages, "tool_traces": new_traces}
 
 
-def supervisor_node(state: AgentState) -> dict[str, Any]:
+def supervisor_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+    provider = config.get("configurable", {}).get("provider")
+    model = config.get("configurable", {}).get("model")
+    _, llm = _build_llm(provider, model)
+    supervisor_chain = llm.with_structured_output(SupervisorDecision)
+
     user_query = _original_user_query(state)
     tool_traces = state.get("tool_traces", [])
     decision_input = (
@@ -237,7 +255,7 @@ checkpointer = MemorySaver()
 compiled_graph = builder.compile(checkpointer=checkpointer)
 
 
-def invoke_graph(query: str, thread_id: str) -> dict[str, Any]:
+def invoke_graph(query: str, thread_id: str, provider: str | None = None, model: str | None = None) -> dict[str, Any]:
     """Invoke the compiled graph using thread-scoped state persistence."""
     initial_state: AgentState = {
         "messages": [HumanMessage(content=query)],
@@ -245,7 +263,7 @@ def invoke_graph(query: str, thread_id: str) -> dict[str, Any]:
         "tool_traces": [],
     }
     config = {
-        "configurable": {"thread_id": thread_id},
+        "configurable": {"thread_id": thread_id, "provider": provider, "model": model},
         "recursion_limit": 10,
     }
     return compiled_graph.invoke(initial_state, config=config)
