@@ -23,16 +23,17 @@ def _dummy_openai_callback():
 
 
 def test_execute_returns_200_with_valid_payload(monkeypatch):
+    monkeypatch.setattr(main, "resolve_provider", lambda p: "openai")
     monkeypatch.setattr(
         main,
         "invoke_graph",
-        lambda query, thread_id: {
+        lambda query, thread_id, provider=None, model=None: {
             "messages": [AIMessage(content=f"Answer for: {query}")],
             "next": "FINISH",
             "tool_traces": [],
         },
     )
-    monkeypatch.setattr(main, "get_llm_callback", _dummy_openai_callback)
+    monkeypatch.setattr(main, "get_openai_callback", _dummy_openai_callback)
 
     client = TestClient(main.app)
     response = client.post(
@@ -66,12 +67,13 @@ def test_execute_returns_422_when_thread_id_missing():
 
 
 def test_execute_returns_408_on_timeout(monkeypatch):
+    monkeypatch.setattr(main, "resolve_provider", lambda p: "openai")
     # Simulate an upstream timeout from the LLM provider
-    def mock_invoke_timeout(query, thread_id):
+    def mock_invoke_timeout(query, thread_id, provider=None, model=None):
         raise asyncio.TimeoutError("Timeout")
 
     monkeypatch.setattr(main, "invoke_graph", mock_invoke_timeout)
-    monkeypatch.setattr(main, "get_llm_callback", _dummy_openai_callback)
+    monkeypatch.setattr(main, "get_openai_callback", _dummy_openai_callback)
 
     client = TestClient(main.app)
     response = client.post(
@@ -83,8 +85,9 @@ def test_execute_returns_408_on_timeout(monkeypatch):
 
 
 def test_execute_returns_502_on_provider_outage(monkeypatch):
+    monkeypatch.setattr(main, "resolve_provider", lambda p: "openai")
     # Simulate an OpenAI 500+ internal server error
-    def mock_invoke_outage(query, thread_id):
+    def mock_invoke_outage(query, thread_id, provider=None, model=None):
         # Constructing the expected openai error format
         request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
         response = httpx.Response(503, request=request)
@@ -95,7 +98,7 @@ def test_execute_returns_502_on_provider_outage(monkeypatch):
         )
 
     monkeypatch.setattr(main, "invoke_graph", mock_invoke_outage)
-    monkeypatch.setattr(main, "get_llm_callback", _dummy_openai_callback)
+    monkeypatch.setattr(main, "get_openai_callback", _dummy_openai_callback)
 
     client = TestClient(main.app)
     response = client.post(

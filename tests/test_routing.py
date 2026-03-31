@@ -24,16 +24,22 @@ class _FakeSupervisorChain:
         return self._decisions
 
 
+class _FakeLLM:
+    def __init__(self, decisions):
+        self.chain = _FakeSupervisorChain(decisions)
+    
+    def with_structured_output(self, schema):
+        return self.chain
+
+
 def test_supervisor_routes_facts_query_to_research(monkeypatch):
     monkeypatch.setattr(
         graph,
-        "supervisor_chain",
-        _FakeSupervisorChain(
-            graph.SupervisorDecision(next=graph.RouteChoice.RESEARCH)
-        ),
+        "_build_llm",
+        lambda p, m: ("mocked", _FakeLLM(graph.SupervisorDecision(next=graph.RouteChoice.RESEARCH)))
     )
 
-    result = graph.supervisor_node(_state_for("Who founded Pink Floyd?"))
+    result = graph.supervisor_node(_state_for("Who founded Pink Floyd?"), config={})
 
     assert result == {"next": "ResearchAgent"}
 
@@ -41,13 +47,11 @@ def test_supervisor_routes_facts_query_to_research(monkeypatch):
 def test_supervisor_routes_compute_query_to_analysis(monkeypatch):
     monkeypatch.setattr(
         graph,
-        "supervisor_chain",
-        _FakeSupervisorChain(
-            graph.SupervisorDecision(next=graph.RouteChoice.ANALYSIS)
-        ),
+        "_build_llm",
+        lambda p, m: ("mocked", _FakeLLM(graph.SupervisorDecision(next=graph.RouteChoice.ANALYSIS)))
     )
 
-    result = graph.supervisor_node(_state_for("Calculate 10 + 20 / 2"))
+    result = graph.supervisor_node(_state_for("Calculate 10 + 20 / 2"), config={})
 
     assert result == {"next": "AnalysisAgent"}
 
@@ -58,11 +62,16 @@ def test_supervisor_multi_hop_progression(monkeypatch):
         graph.SupervisorDecision(next=graph.RouteChoice.ANALYSIS),
         graph.SupervisorDecision(next=graph.RouteChoice.FINISH),
     ]
-    monkeypatch.setattr(graph, "supervisor_chain", _FakeSupervisorChain(decisions))
+    fake_llm = _FakeLLM(decisions)
+    monkeypatch.setattr(
+        graph,
+        "_build_llm",
+        lambda p, m: ("mocked", fake_llm)
+    )
 
     state = _state_for("Find top 5 longest Pink Floyd songs and compute average length.")
 
-    first = graph.supervisor_node(state)
+    first = graph.supervisor_node(state, config={})
     state["tool_traces"].append(
         {
             "agent": "ResearchAgent",
@@ -71,7 +80,7 @@ def test_supervisor_multi_hop_progression(monkeypatch):
             "output": "mocked results",
         }
     )
-    second = graph.supervisor_node(state)
+    second = graph.supervisor_node(state, config={})
     state["tool_traces"].append(
         {
             "agent": "AnalysisAgent",
@@ -80,7 +89,7 @@ def test_supervisor_multi_hop_progression(monkeypatch):
             "output": "420.3",
         }
     )
-    third = graph.supervisor_node(state)
+    third = graph.supervisor_node(state, config={})
 
     assert first == {"next": "ResearchAgent"}
     assert second == {"next": "AnalysisAgent"}

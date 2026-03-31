@@ -101,10 +101,10 @@ def execute(request: ExecuteRequest) -> ExecuteResponse:
             completion_tokens=int(getattr(cb, "completion_tokens", 0) or 0),
             total_cost_usd=float(getattr(cb, "total_cost", 0.0) or 0.0),
         )
-    except EnvironmentError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
         raise HTTPException(status_code=408, detail="Upstream model request timed out.") from exc
+    except EnvironmentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except openai.APIStatusError as exc:
         status_code = getattr(exc, "status_code", None)
         if status_code is not None and int(status_code) >= 500:
