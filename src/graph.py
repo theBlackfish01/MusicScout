@@ -1,10 +1,9 @@
-import operator
 import os
 from enum import Enum
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables.config import RunnableConfig
 from langchain_core.tools import tool as lc_tool
 from langchain_experimental.utilities import PythonREPL
@@ -22,22 +21,16 @@ except ImportError:  # pragma: no cover - compatibility fallback
     from langchain.utilities import WikipediaAPIWrapper
 
 import dotenv
+
 dotenv.load_dotenv()
 
 
-class ToolTrace(TypedDict):
-    agent: str
-    tool: str
-    input: str
-    output: str
-
-
+# --- State Management ---
+# Notice how lean this is now. We rely on the conversation history rather than custom counters.
 class AgentState(TypedDict):
-    # add_messages reducer: node updates are appended, never overwrite
     messages: Annotated[list[BaseMessage], add_messages]
     next: str
-    # operator.add reducer: node updates are concatenated
-    tool_traces: Annotated[list[ToolTrace], operator.add]
+    sender: str  # Tracks which agent most recently executed
 
 
 class RouteChoice(str, Enum):
@@ -50,6 +43,7 @@ class SupervisorDecision(BaseModel):
     next: RouteChoice
 
 
+# --- Provider & LLM Setup ---
 def resolve_provider(provider_override: str | None = None) -> str:
     """Resolve the active provider, considering overrides and environment variables."""
     provider = provider_override or os.getenv("LLM_PROVIDER", "")
@@ -68,23 +62,19 @@ def resolve_provider(provider_override: str | None = None) -> str:
 
 
 def _build_llm(provider_override: str | None = None, model_override: str | None = None) -> tuple[str, BaseChatModel]:
-    """Select and instantiate the LLM based on environment configuration or request overrides.
-
-    Priority:
-      1. Request overrides
-      2. LLM_PROVIDER env var
-      3. OPENAI_API_KEY/GEMINI_API_KEY present
-    """
+    """Select and instantiate the LLM based on environment configuration or request overrides."""
     provider = resolve_provider(provider_override)
 
     if provider == "openai":
         from langchain_openai import ChatOpenAI
+
         return "openai", ChatOpenAI(
             model=model_override or os.getenv("OPENAI_MODEL", "gpt-4o"),
             temperature=0,
         )
     if provider == "gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
+
         return "gemini", ChatGoogleGenerativeAI(
             model=model_override or os.getenv("GEMINI_MODEL", "gemini-1.5-pro"),
             google_api_key=os.getenv("GEMINI_API_KEY"),
@@ -96,149 +86,122 @@ def _build_llm(provider_override: str | None = None, model_override: str | None 
 
 
 # --- Tools ---
-
-duckduckgo_tool: DuckDuckGoSearchRun = DuckDuckGoSearchRun()
-wikipedia_tool: WikipediaQueryRun = WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper())
+duckduckgo_tool = DuckDuckGoSearchRun()
+wikipedia_tool = WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper())
 _python_repl = PythonREPL()
 
 
 @lc_tool
 def python_repl_tool(code: str) -> str:
     """Execute Python code for arithmetic, statistics, and data analysis.
-    Input must be valid, executable Python code."""
+    Input must be valid, executable Python code.
+    IMPORTANT: You MUST use print() to output the final result.
+    IMPORTANT: Use the standard Python library ONLY. Do NOT import pandas, numpy, or other external libraries.
+    If you do not use print(), you will receive no output!"""
     return _python_repl.run(code)
 
 
 research_tools = [duckduckgo_tool, wikipedia_tool]
 analysis_tools = [python_repl_tool]
-_research_tool_node = ToolNode(research_tools)
-_analysis_tool_node = ToolNode(analysis_tools)
-
-# --- LLM and chains ---
-# Chains are now instantiated lazily within nodes using overrides from RunnableConfig.
-
-SUPERVISOR_SYSTEM_PROMPT = """You are a routing supervisor. Based on the query and tool_traces, decide which agent to call next.
-If the query requires searching for facts, names, or history, route to ResearchAgent.
-If the query requires arithmetic, ranking, or data structuring, route to AnalysisAgent.
-If mathematical calculation is required, you MUST route to AnalysisAgent before returning FINISH.
-Return FINISH only when the final answer is complete and all required computations are done."""
 
 
-# --- Helpers ---
-
-def _message_text(message: BaseMessage) -> str:
-    content = message.content
-    if isinstance(content, str):
-        return content
-    return str(content)
+def _handle_tool_error(e: Exception) -> str:
+    return f"Tool execution failed: {type(e).__name__}: {e}"
 
 
-def _original_user_query(state: AgentState) -> str:
-    for message in state.get("messages", []):
-        if isinstance(message, HumanMessage):
-            return _message_text(message)
-    messages = state.get("messages", [])
-    return _message_text(messages[-1]) if messages else ""
-
-
-# --- Node functions ---
-
-_RESEARCH_SYSTEM_MSG = SystemMessage(
-    content="You are a music research expert. Use the available search tools to find "
-            "accurate facts, biographies, history, and current information relevant to "
-            "the user's query. Always call a tool — do not answer from memory alone."
-)
-
-_ANALYSIS_SYSTEM_MSG = SystemMessage(
-    content="You are a data analysis expert. Use the python_repl_tool to write and execute "
-            "Python code for all calculations, aggregations, and statistical analysis. "
-            "Always call the tool — do not compute in your head."
-)
-
-
-def research_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-    """LLM autonomously selects and invokes research tools, then synthesises findings."""
-    provider = config.get("configurable", {}).get("provider")
-    model = config.get("configurable", {}).get("model")
-    _, llm = _build_llm(provider, model)
-    research_llm = llm.bind_tools(research_tools)
-
-    ai_msg = research_llm.invoke([_RESEARCH_SYSTEM_MSG] + state["messages"])
-    new_messages: list[BaseMessage] = [ai_msg]
-    new_traces: list[ToolTrace] = []
-
-    if ai_msg.tool_calls:
-        tool_msgs = _research_tool_node.invoke({"messages": [ai_msg]})["messages"]
-        new_messages.extend(tool_msgs)
-        for tc, tm in zip(ai_msg.tool_calls, tool_msgs):
-            new_traces.append({
-                "agent": "ResearchAgent",
-                "tool": tc["name"],
-                "input": str(tc["args"]),
-                "output": str(tm.content),
-            })
-        # Synthesise findings with full conversation context
-        synthesis = llm.invoke(state["messages"] + new_messages)
-        new_messages.append(synthesis)
-
-    return {"messages": new_messages, "tool_traces": new_traces}
-
-
-def analysis_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-    """LLM autonomously generates and executes Python code via the REPL tool."""
-    provider = config.get("configurable", {}).get("provider")
-    model = config.get("configurable", {}).get("model")
-    _, llm = _build_llm(provider, model)
-    analysis_llm = llm.bind_tools(analysis_tools)
-
-    ai_msg = analysis_llm.invoke([_ANALYSIS_SYSTEM_MSG] + state["messages"])
-    new_messages: list[BaseMessage] = [ai_msg]
-    new_traces: list[ToolTrace] = []
-
-    if ai_msg.tool_calls:
-        tool_msgs = _analysis_tool_node.invoke({"messages": [ai_msg]})["messages"]
-        new_messages.extend(tool_msgs)
-        for tc, tm in zip(ai_msg.tool_calls, tool_msgs):
-            new_traces.append({
-                "agent": "AnalysisAgent",
-                "tool": tc["name"],
-                "input": str(tc["args"]),
-                "output": str(tm.content),
-            })
-        # Synthesise results with full conversation context
-        synthesis = llm.invoke(state["messages"] + new_messages)
-        new_messages.append(synthesis)
-
-    return {"messages": new_messages, "tool_traces": new_traces}
-
+# --- Nodes ---
 
 def supervisor_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+    """The Supervisor reads the full history and decides what to do next."""
     provider = config.get("configurable", {}).get("provider")
     model = config.get("configurable", {}).get("model")
     _, llm = _build_llm(provider, model)
     supervisor_chain = llm.with_structured_output(SupervisorDecision)
 
-    user_query = _original_user_query(state)
-    tool_traces = state.get("tool_traces", [])
-    decision_input = (
-        f"User query:\n{user_query}\n\n"
-        f"Current tool traces:\n{tool_traces}\n\n"
-        "Return only the next route."
+    sys_msg = SystemMessage(
+        content=(
+            "You are a routing supervisor managing a ResearchAgent and an AnalysisAgent. "
+            "Review the conversation history. "
+            "\n- If the user's request is fully answered, route to FINISH."
+            "\n- If new factual data needs to be gathered, route to ResearchAgent."
+            "\n- If calculations or data analysis are needed, route to AnalysisAgent."
+            "\n- CRITICAL: If an agent has reported they cannot find the information or cannot "
+            "perform the calculation after trying, route to FINISH to gracefully exit. Do NOT "
+            "trap the system in a loop."
+        )
     )
-    decision = supervisor_chain.invoke(
-        [SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT), HumanMessage(content=decision_input)]
-    )
+
+    decision = supervisor_chain.invoke([sys_msg] + state["messages"])
     return {"next": decision.next.value}
 
 
-# --- Graph assembly ---
+def research_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+    provider = config.get("configurable", {}).get("provider")
+    model = config.get("configurable", {}).get("model")
+    _, llm = _build_llm(provider, model)
+    research_llm = llm.bind_tools(research_tools)
 
+    sys_msg = SystemMessage(
+        content=(
+            "You are a music research expert. Use the available search tools to find "
+            "accurate facts relevant to the user's query. If you cannot find the required "
+            "information after searching, state clearly that the data is unavailable."
+        )
+    )
+
+    ai_msg = research_llm.invoke([sys_msg] + state["messages"])
+    return {"messages": [ai_msg], "sender": "ResearchAgent"}
+
+
+def analysis_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+    provider = config.get("configurable", {}).get("provider")
+    model = config.get("configurable", {}).get("model")
+    _, llm = _build_llm(provider, model)
+    analysis_llm = llm.bind_tools(analysis_tools)
+
+    sys_msg = SystemMessage(
+        content=(
+            "You are a data analysis expert. Use the python_repl_tool to calculate answers based "
+            "on the conversation history. If the required data to perform the calculation is missing, "
+            "state clearly what data is needed."
+        )
+    )
+
+    ai_msg = analysis_llm.invoke([sys_msg] + state["messages"])
+    return {"messages": [ai_msg], "sender": "AnalysisAgent"}
+
+
+# --- Edge Logic ---
+
+def research_condition(state: AgentState) -> Literal["ResearchTools", "Supervisor"]:
+    """Route to tools if the ResearchAgent made a tool call, otherwise back to Supervisor."""
+    last_message = state["messages"][-1]
+    if getattr(last_message, "tool_calls", None):
+        return "ResearchTools"
+    return "Supervisor"
+
+
+def analysis_condition(state: AgentState) -> Literal["AnalysisTools", "Supervisor"]:
+    """Route to tools if the AnalysisAgent made a tool call, otherwise back to Supervisor."""
+    last_message = state["messages"][-1]
+    if getattr(last_message, "tool_calls", None):
+        return "AnalysisTools"
+    return "Supervisor"
+
+
+# --- Graph Construction ---
 builder = StateGraph(AgentState)
+
+# Add Nodes
 builder.add_node("Supervisor", supervisor_node)
 builder.add_node("ResearchAgent", research_node)
+builder.add_node("ResearchTools", ToolNode(research_tools, handle_tool_errors=_handle_tool_error))
 builder.add_node("AnalysisAgent", analysis_node)
+builder.add_node("AnalysisTools", ToolNode(analysis_tools, handle_tool_errors=_handle_tool_error))
 
+# Add Edges
 builder.add_edge(START, "Supervisor")
+
 builder.add_conditional_edges(
     "Supervisor",
     lambda state: state["next"],
@@ -248,22 +211,34 @@ builder.add_conditional_edges(
         RouteChoice.FINISH.value: END,
     },
 )
-builder.add_edge("ResearchAgent", "Supervisor")
-builder.add_edge("AnalysisAgent", "Supervisor")
+
+# Agent -> Tool -> Agent loops
+builder.add_conditional_edges("ResearchAgent", research_condition)
+builder.add_edge("ResearchTools", "ResearchAgent")
+
+builder.add_conditional_edges("AnalysisAgent", analysis_condition)
+builder.add_edge("AnalysisTools", "AnalysisAgent")
 
 checkpointer = MemorySaver()
 compiled_graph = builder.compile(checkpointer=checkpointer)
 
 
-def invoke_graph(query: str, thread_id: str, provider: str | None = None, model: str | None = None) -> dict[str, Any]:
-    """Invoke the compiled graph using thread-scoped state persistence."""
-    initial_state: AgentState = {
+# --- Invocation Method ---
+def invoke_graph(
+        query: str,
+        thread_id: str,
+        provider: str | None = None,
+        model: str | None = None,
+) -> dict[str, Any]:
+    # We only inject the new message. LangGraph's checkpointer will correctly
+    # append this to the history for an existing thread_id.
+    initial_state = {
         "messages": [HumanMessage(content=query)],
-        "next": "Supervisor",
-        "tool_traces": [],
     }
+
     config = {
         "configurable": {"thread_id": thread_id, "provider": provider, "model": model},
-        "recursion_limit": 10,
+        "recursion_limit": 30,  # Increased slightly to account for the flattened tool node hops
     }
+
     return compiled_graph.invoke(initial_state, config=config)

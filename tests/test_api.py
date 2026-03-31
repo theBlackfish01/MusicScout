@@ -1,11 +1,11 @@
+import asyncio
 from contextlib import contextmanager
 
-from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessage
-
-import asyncio
 import httpx
 import openai
+from fastapi.testclient import TestClient
+from langchain_core.messages import AIMessage
+from langgraph.errors import GraphRecursionError
 
 from src import main
 
@@ -30,7 +30,7 @@ def test_execute_returns_200_with_valid_payload(monkeypatch):
         lambda query, thread_id, provider=None, model=None: {
             "messages": [AIMessage(content=f"Answer for: {query}")],
             "next": "FINISH",
-            "tool_traces": [],
+            "sender": "Supervisor",
         },
     )
     monkeypatch.setattr(main, "get_openai_callback", _dummy_openai_callback)
@@ -68,6 +68,7 @@ def test_execute_returns_422_when_thread_id_missing():
 
 def test_execute_returns_408_on_timeout(monkeypatch):
     monkeypatch.setattr(main, "resolve_provider", lambda p: "openai")
+
     # Simulate an upstream timeout from the LLM provider
     def mock_invoke_timeout(query, thread_id, provider=None, model=None):
         raise asyncio.TimeoutError("Timeout")
@@ -84,8 +85,86 @@ def test_execute_returns_408_on_timeout(monkeypatch):
     assert response.json()["detail"] == "Upstream model request timed out."
 
 
+def test_execute_returns_409_on_graph_recursion(monkeypatch):
+    monkeypatch.setattr(main, "resolve_provider", lambda p: "openai")
+
+    def mock_invoke_recursion(query, thread_id, provider=None, model=None):
+        raise GraphRecursionError("Recursion limit of 10 reached")
+
+    monkeypatch.setattr(main, "invoke_graph", mock_invoke_recursion)
+    monkeypatch.setattr(main, "get_openai_callback", _dummy_openai_callback)
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/v1/execute", json={"query": "Test recursion", "thread_id": "thread-1"}
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "GRAPH_NON_CONVERGENCE"
+    assert "Recursion limit" in detail["reason"]
+
+
+def test_execute_extracts_gemini_list_content(monkeypatch):
+    """Gemini returns content as a list of dicts — should be flattened to text."""
+    gemini_content = [
+        " I will analyze the data.",
+        {"type": "text", "text": "The average BPM is 120.", "extras": {"signature": "abc123"}},
+    ]
+    monkeypatch.setattr(main, "resolve_provider", lambda p: "gemini")
+    monkeypatch.setattr(
+        main,
+        "invoke_graph",
+        lambda query, thread_id, provider=None, model=None: {
+            "messages": [AIMessage(content=gemini_content)],
+            "next": "FINISH",
+            "sender": "AnalysisAgent",
+        },
+    )
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/v1/execute",
+        json={"query": "Calculate BPM", "thread_id": "thread-1"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "average BPM is 120" in body["answer"]
+    assert "[{" not in body["answer"]  # No raw list repr
+
+
+def test_execute_extracts_gemini_token_usage(monkeypatch):
+    """When OpenAI callback returns 0, fall back to usage_metadata on AIMessages."""
+    monkeypatch.setattr(main, "resolve_provider", lambda p: "gemini")
+    msg = AIMessage(content="Answer")
+    msg.usage_metadata = {"total_tokens": 500, "input_tokens": 350, "output_tokens": 150}
+    monkeypatch.setattr(
+        main,
+        "invoke_graph",
+        lambda query, thread_id, provider=None, model=None: {
+            "messages": [msg],
+            "next": "FINISH",
+            "sender": "Supervisor",
+        },
+    )
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/v1/execute",
+        json={"query": "Test tokens", "thread_id": "thread-1"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_tokens"] == 500
+    assert body["prompt_tokens"] == 350
+    assert body["completion_tokens"] == 150
+
+
 def test_execute_returns_502_on_provider_outage(monkeypatch):
     monkeypatch.setattr(main, "resolve_provider", lambda p: "openai")
+
     # Simulate an OpenAI 500+ internal server error
     def mock_invoke_outage(query, thread_id, provider=None, model=None):
         # Constructing the expected openai error format

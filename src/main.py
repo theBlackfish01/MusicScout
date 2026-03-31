@@ -6,7 +6,8 @@ from typing import Any
 import httpx
 import openai
 from fastapi import FastAPI, HTTPException
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import BaseMessage
+from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel, Field
 
 from src.graph import invoke_graph, resolve_provider
@@ -21,7 +22,6 @@ except ImportError:
 
 @contextmanager
 def _null_callback():
-    """No-op token-tracking context manager for providers without a LangChain callback."""
     yield SimpleNamespace(total_tokens=0, prompt_tokens=0, completion_tokens=0, total_cost=0.0)
 
 
@@ -30,15 +30,16 @@ try:
 except ImportError:
     get_openai_callback = _null_callback
 
-
 import dotenv
+
 dotenv.load_dotenv()
+
 
 class ExecuteRequest(BaseModel):
     query: str = Field(..., min_length=1)
     thread_id: str = Field(..., min_length=1)
     provider: str | None = Field(default=None, description="Optional LLM provider ('openai' or 'gemini')")
-    model: str | None = Field(default=None, description="Optional model name (e.g., 'gpt-4o', 'gemini-1.5-pro')")
+    model: str | None = Field(default=None, description="Optional model name")
 
 
 class ExecuteResponse(BaseModel):
@@ -56,8 +57,8 @@ class HealthResponse(BaseModel):
 app = FastAPI()
 
 
-
 def _message_to_text(message: Any) -> str:
+    """Extract plain text from a message, handling both strings and Gemini's list content."""
     if isinstance(message, BaseMessage):
         content = message.content
     elif isinstance(message, dict):
@@ -67,53 +68,84 @@ def _message_to_text(message: Any) -> str:
 
     if isinstance(content, str):
         return content
+    if isinstance(content, list):
+        return "\n".join(i if isinstance(i, str) else i.get("text", "") for i in content)
     return str(content)
 
 
-def _extract_answer(state: dict[str, Any]) -> str:
-    messages = state.get("messages", [])
-    for message in reversed(messages):
-        if isinstance(message, AIMessage):
-            return _message_to_text(message)
-        if isinstance(message, dict) and message.get("type") == "ai":
-            return _message_to_text(message)
-    return ""
+def _extract_usage(state: dict[str, Any]) -> dict[str, int]:
+    """Sum token usage from usage_metadata on messages (works for Gemini and others)."""
+    usage = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
+    for msg in state.get("messages", []):
+        meta = None
+        if isinstance(msg, BaseMessage):
+            meta = getattr(msg, "usage_metadata", None)
+        elif isinstance(msg, dict):
+            meta = msg.get("usage_metadata")
+
+        if isinstance(meta, dict):
+            usage["total_tokens"] += meta.get("total_tokens", 0) or 0
+            usage["input_tokens"] += meta.get("input_tokens", 0) or 0
+            usage["output_tokens"] += meta.get("output_tokens", 0) or 0
+    return usage
 
 
 @app.post("/v1/execute", response_model=ExecuteResponse)
 def execute(request: ExecuteRequest) -> ExecuteResponse:
     try:
-        resolved_provider = resolve_provider(request.provider)
-        cb_manager = get_openai_callback if resolved_provider == "openai" else _null_callback
+        provider = resolve_provider(request.provider)
+        cb_manager = get_openai_callback if provider == "openai" else _null_callback
 
         with cb_manager() as cb:
             final_state = invoke_graph(
-                query=request.query, 
+                query=request.query,
                 thread_id=request.thread_id,
                 provider=request.provider,
                 model=request.model
             )
-        answer = _extract_answer(final_state)
+
+        # Extract answer from the final message
+        messages = final_state.get("messages", [])
+        answer = _message_to_text(messages[-1]) if messages else ""
+
+        # Extract tokens (preferring callback, falling back to message metadata)
+        total_tokens = int(getattr(cb, "total_tokens", 0) or 0)
+        prompt_tokens = int(getattr(cb, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(cb, "completion_tokens", 0) or 0)
+        total_cost = float(getattr(cb, "total_cost", 0.0) or 0.0)
+
+        if total_tokens == 0:
+            usage = _extract_usage(final_state)
+            total_tokens = usage["total_tokens"]
+            prompt_tokens = usage["input_tokens"]
+            completion_tokens = usage["output_tokens"]
+
         return ExecuteResponse(
             answer=answer,
-            total_tokens=int(getattr(cb, "total_tokens", 0) or 0),
-            prompt_tokens=int(getattr(cb, "prompt_tokens", 0) or 0),
-            completion_tokens=int(getattr(cb, "completion_tokens", 0) or 0),
-            total_cost_usd=float(getattr(cb, "total_cost", 0.0) or 0.0),
+            total_tokens=total_tokens,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_cost_usd=total_cost,
         )
+
     except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
         raise HTTPException(status_code=408, detail="Upstream model request timed out.") from exc
     except EnvironmentError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except GraphRecursionError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "GRAPH_NON_CONVERGENCE", "reason": str(exc)},
+        ) from exc
     except openai.APIStatusError as exc:
-        status_code = getattr(exc, "status_code", None)
-        if status_code is not None and int(status_code) >= 500:
+        if getattr(exc, "status_code", None) and int(exc.status_code) >= 500:
             raise HTTPException(status_code=502, detail="Upstream model provider is unavailable.") from exc
         raise
     except Exception as exc:
         if _GOOGLE_SERVER_ERRORS and isinstance(exc, _GOOGLE_SERVER_ERRORS):
             raise HTTPException(status_code=502, detail="Upstream model provider is unavailable.") from exc
         raise
+
 
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
