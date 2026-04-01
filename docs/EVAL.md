@@ -11,7 +11,26 @@ To solve this, MusicScout employs a Supervisor Architecture using LangGraph to o
 
 ---
 
-## 2. Architectural Evolution & LLM Failure Analysis
+## 2. Feature Implementation & Evaluation
+
+### State Persistence
+
+The system utilizes LangGraph's `SqliteSaver` coupled with a physical `checkpoints.sqlite` database to ensure state persistence across API lifecycles.
+
+**Testing Persistence:** This can be verified by simulating a server interruption:
+
+1. Send a query via `POST /v1/execute` using a unique `thread_id` (e.g., `thread-123`).
+2. Stop the FastAPI server completely.
+3. Restart the server.
+4. Send a follow-up query (e.g., "What was the first album you mentioned?") using the *same* `thread_id`. The Supervisor will successfully read the historical state from the database and answer without re-triggering the ResearchAgent.
+
+### Trace Logging Integration
+
+To ensure the multi-agent orchestration is entirely observable without requiring a LangSmith dashboard, the FastAPI endpoint extracts and surfaces the execution trace natively. The system iterates through the final state array, mapping `AIMessage` tool calls to their corresponding `ToolMessage` outputs, and returns this step-by-step trace in the JSON response payload.
+
+---
+
+## 3. Architectural Evolution & LLM Failure Analysis
 
 During development, the system exhibited several classic "agentic failure modes." Diagnosing and engineering around these failures was critical to achieving a stable production state.
 
@@ -30,25 +49,6 @@ During development, the system exhibited several classic "agentic failure modes.
 * **Failure Mode 4: The "Stubborn Supervisor"**
   * *The Issue:* If the AnalysisAgent threw an error asking for more data, the Supervisor—knowing the data was already in the chat—would argue with its worker and stubbornly re-route the task back to it, causing another infinite loop.
   * *The Fix:* I implemented deterministic overrides in the Supervisor node. If an agent outputs a hardcoded `SYSTEM ERROR` string, the Python routing logic intercepts it and forces a `FINISH` route, ensuring the system never relies solely on LLM compliance to break a death loop.
-
----
-
-## 3. Feature Implementation & Evaluation
-
-### State Persistence
-
-The system utilizes LangGraph's `SqliteSaver` coupled with a physical `checkpoints.sqlite` database to ensure state persistence across API lifecycles.
-
-**Testing Persistence:** This can be verified by simulating a server interruption:
-
-1. Send a query via `POST /v1/execute` using a unique `thread_id` (e.g., `thread-123`).
-2. Stop the FastAPI server completely.
-3. Restart the server.
-4. Send a follow-up query (e.g., "What was the first album you mentioned?") using the *same* `thread_id`. The Supervisor will successfully read the historical state from the database and answer without re-triggering the ResearchAgent.
-
-### Trace Logging Integration
-
-To ensure the multi-agent orchestration is entirely observable without requiring a LangSmith dashboard, the FastAPI endpoint extracts and surfaces the execution trace natively. The system iterates through the final state array, mapping `AIMessage` tool calls to their corresponding `ToolMessage` outputs, and returns this step-by-step trace in the JSON response payload.
 
 ---
 
