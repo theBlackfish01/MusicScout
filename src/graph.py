@@ -1,13 +1,15 @@
 import os
+import sqlite3
 from enum import Enum
+from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_core.runnables.config import RunnableConfig
 from langchain_core.tools import tool as lc_tool
 from langchain_experimental.utilities import PythonREPL
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -26,11 +28,10 @@ dotenv.load_dotenv()
 
 
 # --- State Management ---
-# Notice how lean this is now. We rely on the conversation history rather than custom counters.
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     next: str
-    sender: str  # Tracks which agent most recently executed
+    sender: str
 
 
 class RouteChoice(str, Enum):
@@ -113,6 +114,14 @@ def _handle_tool_error(e: Exception) -> str:
 
 def supervisor_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     """The Supervisor reads the full history and decides what to do next."""
+    messages = state.get("messages", [])
+
+    # DETERMINISTIC OVERRIDE: If the last message is a hard system error, force an exit.
+    if messages:
+        last_content = str(messages[-1].content)
+        if "SYSTEM ERROR:" in last_content or "Calculation failed" in last_content:
+            return {"next": RouteChoice.FINISH.value}
+
     provider = config.get("configurable", {}).get("provider")
     model = config.get("configurable", {}).get("model")
     _, llm = _build_llm(provider, model)
@@ -124,7 +133,9 @@ def supervisor_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
             "Review the conversation history. "
             "\n- If the user's request is fully answered, route to FINISH."
             "\n- If new factual data needs to be gathered, route to ResearchAgent."
-            "\n- If calculations or data analysis are needed, route to AnalysisAgent."
+            "\n- If calculations or data analysis are needed, FIRST verify if the raw numbers/dates "
+            "are already present in the conversation history. If the required data is missing, "
+            "route to the ResearchAgent to gather it. If the data is present, route to the AnalysisAgent."
             "\n- CRITICAL: If an agent has reported they cannot find the information or cannot "
             "perform the calculation after trying, route to FINISH to gracefully exit. Do NOT "
             "trap the system in a loop."
@@ -144,8 +155,13 @@ def research_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     sys_msg = SystemMessage(
         content=(
             "You are a music research expert. Use the available search tools to find "
-            "accurate facts relevant to the user's query. If you cannot find the required "
-            "information after searching, state clearly that the data is unavailable."
+            "accurate facts and raw data relevant to the user's query."
+            "\n- IMPORTANT: Gather raw formats (e.g., MM:SS). Do NOT attempt to perform math."
+            "\n- CRITICAL: Output ONLY the requested data. Do NOT ask follow-up questions."
+            "\n- ANTI-RABBIT HOLE: You have a strict limit of 2-3 searches per missing fact. "
+            "If the exact data is buried, messy, or unavailable after 3 attempts, you MUST stop "
+            "searching. Use the best available estimate you found, or explicitly output "
+            "'[Data Unavailable]' and move on. Do not get stuck endlessly tweaking search queries."
         )
     )
 
@@ -167,7 +183,18 @@ def analysis_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         )
     )
 
-    ai_msg = analysis_llm.invoke([sys_msg] + state["messages"])
+    # INJECTION: Force the LLM to realize it is its turn to act
+    nudge_msg = HumanMessage(
+        content="Please perform the necessary calculations using the python_repl_tool."
+    )
+
+    ai_msg = analysis_llm.invoke([sys_msg] + state["messages"] + [nudge_msg])
+
+    # SAFETY NET: If the LLM still returns nothing, force a text response so the
+    # Supervisor knows it failed, rather than causing an empty routing loop.
+    if not ai_msg.tool_calls and not str(ai_msg.content).strip():
+        ai_msg = AIMessage(content="SYSTEM ERROR: Calculation failed. I cannot process this request. Route to FINISH.")
+
     return {"messages": [ai_msg], "sender": "AnalysisAgent"}
 
 
@@ -175,10 +202,29 @@ def analysis_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
 
 def research_condition(state: AgentState) -> Literal["ResearchTools", "Supervisor"]:
     """Route to tools if the ResearchAgent made a tool call, otherwise back to Supervisor."""
-    last_message = state["messages"][-1]
-    if getattr(last_message, "tool_calls", None):
+    messages = state["messages"]
+    last_message = messages[-1]
+
+    if not getattr(last_message, "tool_calls", None):
+        return "Supervisor"
+
+    consecutive_tool_calls = 0
+    for msg in reversed(messages):
+        if getattr(msg, "tool_calls", None) or msg.type == "tool":
+            consecutive_tool_calls += 1
+        else:
+            break
+
+    if consecutive_tool_calls >= 6:
+        messages.append(
+            ToolMessage(
+                content="System Override: Search limit reached. Use the best available data you have gathered so far or state it is unavailable.",
+                tool_call_id=last_message.tool_calls[0]["id"]
+            )
+        )
         return "ResearchTools"
-    return "Supervisor"
+
+    return "ResearchTools"
 
 
 def analysis_condition(state: AgentState) -> Literal["AnalysisTools", "Supervisor"]:
@@ -219,7 +265,10 @@ builder.add_edge("ResearchTools", "ResearchAgent")
 builder.add_conditional_edges("AnalysisAgent", analysis_condition)
 builder.add_edge("AnalysisTools", "AnalysisAgent")
 
-checkpointer = MemorySaver()
+_db_path = Path(__file__).resolve().parent.parent / "data" / "checkpoints.sqlite"
+_db_path.parent.mkdir(parents=True, exist_ok=True)
+_conn = sqlite3.connect(str(_db_path), check_same_thread=False)
+checkpointer = SqliteSaver(_conn)
 compiled_graph = builder.compile(checkpointer=checkpointer)
 
 
@@ -238,7 +287,7 @@ def invoke_graph(
 
     config = {
         "configurable": {"thread_id": thread_id, "provider": provider, "model": model},
-        "recursion_limit": 30,  # Increased slightly to account for the flattened tool node hops
+        "recursion_limit": 30, 
     }
 
     return compiled_graph.invoke(initial_state, config=config)

@@ -24,3 +24,5 @@ venv/
 
 CLAUDE.md
 AGENTS.md
+/tmp/
+/data/

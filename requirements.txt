@@ -10,3 +10,4 @@ httpx
 wikipedia
 duckduckgo-search
 langsmith
+langgraph-checkpoint-sqlite

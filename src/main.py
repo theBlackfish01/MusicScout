@@ -1,5 +1,10 @@
 import asyncio
+import warnings
 from contextlib import contextmanager
+
+# Suppress the Wikipedia GuessedAtParserWarning
+warnings.filterwarnings("ignore", "No parser was explicitly specified")
+
 from types import SimpleNamespace
 from typing import Any
 
@@ -34,6 +39,18 @@ import dotenv
 
 dotenv.load_dotenv()
 
+class TraceStep(BaseModel):
+    tool: str
+    input: dict[str, Any]
+    output: str
+
+class ExecuteResponse(BaseModel):
+    answer: str
+    total_tokens: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_cost_usd: float
+    trace_steps: list[TraceStep] = Field(default_factory=list) 
 
 class ExecuteRequest(BaseModel):
     query: str = Field(..., min_length=1)
@@ -108,6 +125,29 @@ def execute(request: ExecuteRequest) -> ExecuteResponse:
         messages = final_state.get("messages", [])
         answer = _message_to_text(messages[-1]) if messages else ""
 
+        trace_steps = []
+        for i, msg in enumerate(messages):
+            # Check if the message is an AIMessage with tool_calls
+            tool_calls = getattr(msg, "tool_calls", [])
+            if tool_calls:
+                for tool_call in tool_calls:
+                    tool_id = tool_call.get("id")
+                    tool_output = ""
+                    
+                    # Look ahead for the corresponding ToolMessage by ID
+                    for next_msg in messages[i + 1:]:
+                        if getattr(next_msg, "type", "") == "tool" and getattr(next_msg, "tool_call_id", "") == tool_id:
+                            tool_output = str(next_msg.content)
+                            break
+                            
+                    trace_steps.append(
+                        TraceStep(
+                            tool=tool_call.get("name", ""),
+                            input=tool_call.get("args", {}),
+                            output=tool_output
+                        )
+                    )
+
         # Extract tokens (preferring callback, falling back to message metadata)
         total_tokens = int(getattr(cb, "total_tokens", 0) or 0)
         prompt_tokens = int(getattr(cb, "prompt_tokens", 0) or 0)
@@ -126,6 +166,7 @@ def execute(request: ExecuteRequest) -> ExecuteResponse:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_cost_usd=total_cost,
+            trace_steps=trace_steps,
         )
 
     except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
