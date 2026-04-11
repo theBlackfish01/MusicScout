@@ -1,6 +1,7 @@
 import os
 import sqlite3
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 
@@ -62,8 +63,15 @@ def resolve_provider(provider_override: str | None = None) -> str:
     return provider
 
 
+@lru_cache(maxsize=8)
 def _build_llm(provider_override: str | None = None, model_override: str | None = None) -> tuple[str, BaseChatModel]:
-    """Select and instantiate the LLM based on environment configuration or request overrides."""
+    """Select and instantiate the LLM based on environment configuration or request overrides.
+
+    Cached by (provider_override, model_override) so the hot graph loop does not
+    re-instantiate the LLM client (and its underlying httpx connection pool) on
+    every node invocation. In tests, monkeypatching ``graph._build_llm`` replaces
+    this attribute entirely, bypassing the cache.
+    """
     provider = resolve_provider(provider_override)
 
     if provider == "openai":
@@ -89,7 +97,6 @@ def _build_llm(provider_override: str | None = None, model_override: str | None 
 # --- Tools ---
 duckduckgo_tool = DuckDuckGoSearchRun()
 wikipedia_tool = WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper())
-_python_repl = PythonREPL()
 
 
 @lc_tool
@@ -99,7 +106,10 @@ def python_repl_tool(code: str) -> str:
     IMPORTANT: You MUST use print() to output the final result.
     IMPORTANT: Use the standard Python library ONLY. Do NOT import pandas, numpy, or other external libraries.
     If you do not use print(), you will receive no output!"""
-    return _python_repl.run(code)
+    # Instantiate a fresh PythonREPL per call. A shared module-level REPL would
+    # leak variables across requests (and across users), which is both a
+    # correctness and privacy bug.
+    return PythonREPL().run(code)
 
 
 research_tools = [duckduckgo_tool, wikipedia_tool]
@@ -169,6 +179,59 @@ def research_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     return {"messages": [ai_msg], "sender": "ResearchAgent"}
 
 
+def research_override_node(state: AgentState) -> dict[str, Any]:
+    """Break out of a runaway research loop.
+
+    When ``research_condition`` detects that too many consecutive tool
+    interactions have occurred, it routes here instead of back to the tool
+    node. This node:
+
+    1. Synthesizes a ``ToolMessage`` for every pending ``tool_call`` on the
+       last AI message, so the message history remains well-formed (the LLM
+       provider SDK will error if any AI ``tool_call`` has no matching
+       ``ToolMessage`` response).
+    2. Appends an ``AIMessage`` halt notice so the Supervisor can see what
+       happened and decide to FINISH or route to analysis with the data
+       already gathered.
+
+    Returning these via the normal node ``dict`` respects the ``add_messages``
+    reducer and the checkpointer — unlike mutating the state inside a
+    conditional edge.
+    """
+    last_message = state["messages"][-1]
+    tool_calls = getattr(last_message, "tool_calls", None) or []
+
+    synthetic_responses: list[BaseMessage] = []
+    for tc in tool_calls:
+        tc_id = tc.get("id") if isinstance(tc, dict) else None
+        if not tc_id:
+            continue
+        synthetic_responses.append(
+            ToolMessage(
+                content=(
+                    "System override: research search budget exhausted. "
+                    "No further tool calls permitted. Use the data already "
+                    "gathered or report '[Data Unavailable]'."
+                ),
+                tool_call_id=tc_id,
+                name=tc.get("name", "research_tool") if isinstance(tc, dict) else "research_tool",
+            )
+        )
+
+    halt_notice = AIMessage(
+        content=(
+            "Research search limit reached. I have stopped searching and will "
+            "return the best data gathered so far. If critical information is "
+            "still missing, I will report '[Data Unavailable]'."
+        )
+    )
+
+    return {
+        "messages": synthetic_responses + [halt_notice],
+        "sender": "ResearchAgent",
+    }
+
+
 def analysis_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     provider = config.get("configurable", {}).get("provider")
     model = config.get("configurable", {}).get("model")
@@ -200,29 +263,35 @@ def analysis_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
 
 # --- Edge Logic ---
 
-def research_condition(state: AgentState) -> Literal["ResearchTools", "Supervisor"]:
-    """Route to tools if the ResearchAgent made a tool call, otherwise back to Supervisor."""
+#: Each search round produces two messages: an AIMessage with tool_calls and
+#: a ToolMessage response. A threshold of 8 consecutive tool-related messages
+#: therefore corresponds to 4 full search round-trips.
+RESEARCH_SEARCH_LIMIT_MSGS = 8
+
+
+def research_condition(state: AgentState) -> Literal["ResearchTools", "ResearchOverride", "Supervisor"]:
+    """Route the ResearchAgent's output.
+
+    PURE function — must not mutate ``state``. Conditional edges are expected
+    to inspect state and return a node name; any state mutation here bypasses
+    the ``add_messages`` reducer and the checkpointer.
+    """
     messages = state["messages"]
     last_message = messages[-1]
 
     if not getattr(last_message, "tool_calls", None):
         return "Supervisor"
 
-    consecutive_tool_calls = 0
+    # Count consecutive tool-related messages walking backwards from the end.
+    consecutive = 0
     for msg in reversed(messages):
-        if getattr(msg, "tool_calls", None) or msg.type == "tool":
-            consecutive_tool_calls += 1
+        if getattr(msg, "tool_calls", None) or getattr(msg, "type", "") == "tool":
+            consecutive += 1
         else:
             break
 
-    if consecutive_tool_calls >= 6:
-        messages.append(
-            ToolMessage(
-                content="System Override: Search limit reached. Use the best available data you have gathered so far or state it is unavailable.",
-                tool_call_id=last_message.tool_calls[0]["id"]
-            )
-        )
-        return "ResearchTools"
+    if consecutive >= RESEARCH_SEARCH_LIMIT_MSGS:
+        return "ResearchOverride"
 
     return "ResearchTools"
 
@@ -242,6 +311,7 @@ builder = StateGraph(AgentState)
 builder.add_node("Supervisor", supervisor_node)
 builder.add_node("ResearchAgent", research_node)
 builder.add_node("ResearchTools", ToolNode(research_tools, handle_tool_errors=_handle_tool_error))
+builder.add_node("ResearchOverride", research_override_node)
 builder.add_node("AnalysisAgent", analysis_node)
 builder.add_node("AnalysisTools", ToolNode(analysis_tools, handle_tool_errors=_handle_tool_error))
 
@@ -258,18 +328,75 @@ builder.add_conditional_edges(
     },
 )
 
-# Agent -> Tool -> Agent loops
-builder.add_conditional_edges("ResearchAgent", research_condition)
+# Agent -> Tool -> Agent loops. ResearchAgent has a third exit: the
+# ResearchOverride node, which breaks runaway search loops by synthesizing
+# well-formed tool responses and routing to the Supervisor for a graceful
+# wind-down.
+builder.add_conditional_edges(
+    "ResearchAgent",
+    research_condition,
+    {
+        "ResearchTools": "ResearchTools",
+        "ResearchOverride": "ResearchOverride",
+        "Supervisor": "Supervisor",
+    },
+)
 builder.add_edge("ResearchTools", "ResearchAgent")
+builder.add_edge("ResearchOverride", "Supervisor")
 
 builder.add_conditional_edges("AnalysisAgent", analysis_condition)
 builder.add_edge("AnalysisTools", "AnalysisAgent")
 
-_db_path = Path(__file__).resolve().parent.parent / "data" / "checkpoints.sqlite"
-_db_path.parent.mkdir(parents=True, exist_ok=True)
-_conn = sqlite3.connect(str(_db_path), check_same_thread=False)
-checkpointer = SqliteSaver(_conn)
+def _open_checkpoint_connection() -> sqlite3.Connection:
+    """Open the sqlite connection used by ``SqliteSaver``.
+
+    Configuration notes:
+
+    - ``check_same_thread=False`` — FastAPI runs sync endpoints on a thread
+      pool, so the connection must be usable from any thread. Python's
+      sqlite3 module still serializes access internally per-connection.
+    - ``isolation_level=None`` — autocommit mode. SqliteSaver issues its own
+      transactions and the default DEFERRED isolation otherwise holds write
+      locks longer than needed.
+    - ``timeout=30.0`` + ``busy_timeout=30000`` — wait up to 30s on a locked
+      database before raising ``OperationalError`` rather than failing
+      immediately under contention.
+    - ``journal_mode=WAL`` — Write-Ahead Logging allows readers and writers
+      to proceed concurrently, which matters as soon as more than one
+      request is in flight.
+    - ``synchronous=NORMAL`` — safe with WAL and significantly faster than
+      the default FULL.
+    """
+    db_path = Path(__file__).resolve().parent.parent / "data" / "checkpoints.sqlite"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(
+        str(db_path),
+        check_same_thread=False,
+        isolation_level=None,
+        timeout=30.0,
+    )
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+_checkpoint_conn = _open_checkpoint_connection()
+checkpointer = SqliteSaver(_checkpoint_conn)
 compiled_graph = builder.compile(checkpointer=checkpointer)
+
+
+def close_checkpointer() -> None:
+    """Close the shared sqlite connection.
+
+    Wired into the FastAPI ``lifespan`` handler in ``main.py`` so the
+    connection is released on application shutdown. Swallows errors because
+    shutdown hooks must not raise.
+    """
+    try:
+        _checkpoint_conn.close()
+    except Exception:
+        pass
 
 
 # --- Invocation Method ---
@@ -287,7 +414,26 @@ def invoke_graph(
 
     config = {
         "configurable": {"thread_id": thread_id, "provider": provider, "model": model},
-        "recursion_limit": 30, 
+        "recursion_limit": 30,
     }
 
-    return compiled_graph.invoke(initial_state, config=config)
+    # Snapshot the prior message count for this thread so callers can extract
+    # ONLY the messages produced by this run (not the accumulated thread
+    # history). Without this, trace_steps and token totals double-count every
+    # message from earlier runs whenever a thread_id is reused.
+    prior_len = 0
+    try:
+        prior_state = compiled_graph.get_state(config)
+    except Exception:
+        prior_state = None
+    if prior_state is not None:
+        prior_values = getattr(prior_state, "values", None) or {}
+        prior_len = len(prior_values.get("messages", []))
+
+    final_state = compiled_graph.invoke(initial_state, config=config)
+
+    if isinstance(final_state, dict):
+        all_messages = final_state.get("messages", [])
+        final_state["new_messages"] = all_messages[prior_len:]
+
+    return final_state

@@ -1,6 +1,6 @@
 import asyncio
 import warnings
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 # Suppress the Wikipedia GuessedAtParserWarning
 warnings.filterwarnings("ignore", "No parser was explicitly specified")
@@ -15,7 +15,7 @@ from langchain_core.messages import BaseMessage
 from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel, Field
 
-from src.graph import invoke_graph, resolve_provider
+from src.graph import close_checkpointer, invoke_graph, resolve_provider
 
 try:
     from google.api_core.exceptions import InternalServerError as _GInternalError
@@ -59,19 +59,20 @@ class ExecuteRequest(BaseModel):
     model: str | None = Field(default=None, description="Optional model name")
 
 
-class ExecuteResponse(BaseModel):
-    answer: str
-    total_tokens: int
-    prompt_tokens: int
-    completion_tokens: int
-    total_cost_usd: float
-
-
 class HealthResponse(BaseModel):
     status: str = "ok"
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Release the shared SqliteSaver connection on application shutdown."""
+    try:
+        yield
+    finally:
+        close_checkpointer()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 def _message_to_text(message: Any) -> str:
@@ -121,32 +122,46 @@ def execute(request: ExecuteRequest) -> ExecuteResponse:
                 model=request.model
             )
 
-        # Extract answer from the final message
+        # Extract answer from the final message (always the most recent in the
+        # full thread history).
         messages = final_state.get("messages", [])
         answer = _message_to_text(messages[-1]) if messages else ""
 
+        # For trace_steps and message-metadata token extraction we MUST only
+        # look at messages produced by this run, not the accumulated thread
+        # history. ``invoke_graph`` attaches ``new_messages`` for this purpose;
+        # if absent (e.g. tests that mock ``invoke_graph``), fall back to the
+        # full message list.
+        new_messages = final_state.get("new_messages", messages)
+
         trace_steps = []
-        for i, msg in enumerate(messages):
+        for i, msg in enumerate(new_messages):
             # Check if the message is an AIMessage with tool_calls
             tool_calls = getattr(msg, "tool_calls", [])
-            if tool_calls:
-                for tool_call in tool_calls:
-                    tool_id = tool_call.get("id")
-                    tool_output = ""
-                    
-                    # Look ahead for the corresponding ToolMessage by ID
-                    for next_msg in messages[i + 1:]:
-                        if getattr(next_msg, "type", "") == "tool" and getattr(next_msg, "tool_call_id", "") == tool_id:
-                            tool_output = str(next_msg.content)
-                            break
-                            
-                    trace_steps.append(
-                        TraceStep(
-                            tool=tool_call.get("name", ""),
-                            input=tool_call.get("args", {}),
-                            output=tool_output
-                        )
+            if not tool_calls:
+                continue
+            for tool_call in tool_calls:
+                tool_id = tool_call.get("id")
+                if tool_id is None:
+                    # Without a stable id we can't reliably pair the call to
+                    # its ToolMessage result; skip rather than mispair.
+                    continue
+                tool_output = ""
+                # Look ahead for the corresponding ToolMessage by ID
+                for next_msg in new_messages[i + 1:]:
+                    if (
+                        getattr(next_msg, "type", "") == "tool"
+                        and getattr(next_msg, "tool_call_id", "") == tool_id
+                    ):
+                        tool_output = str(next_msg.content)
+                        break
+                trace_steps.append(
+                    TraceStep(
+                        tool=tool_call.get("name", ""),
+                        input=tool_call.get("args", {}),
+                        output=tool_output,
                     )
+                )
 
         # Extract tokens (preferring callback, falling back to message metadata)
         total_tokens = int(getattr(cb, "total_tokens", 0) or 0)
@@ -155,7 +170,7 @@ def execute(request: ExecuteRequest) -> ExecuteResponse:
         total_cost = float(getattr(cb, "total_cost", 0.0) or 0.0)
 
         if total_tokens == 0:
-            usage = _extract_usage(final_state)
+            usage = _extract_usage({"messages": new_messages})
             total_tokens = usage["total_tokens"]
             prompt_tokens = usage["input_tokens"]
             completion_tokens = usage["output_tokens"]
